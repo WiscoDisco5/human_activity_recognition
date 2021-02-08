@@ -1,0 +1,300 @@
+---
+title: "Human Activity Recognition"
+author: "John Goodwin"
+date: "12/14/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r dependencies, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(randomForest)
+library(xgboost)
+library(caret)
+
+```
+
+## Introduction
+
+The following project attempts to take human activity data captured by accelerometers to classify a subject's exercise activity. The data for this project was made available by [Groupware@LES](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har). 
+
+Using two popular machine learning algorithms (Gradient Bossted Machines and Random Forests), this project will attempt to produce a classification algorithm that accurately predicts a subject's activity at a point in time based on accelerometer data.
+
+## Data Wrangling
+
+Before modeling can be performed, the data must be downloaded and cleaned up a bit. Blank columns and columns that are not related to the accelerometer data will be removed.
+
+```{r get_data, message=FALSE, warning=FALSE}
+training_file <- "pml-training.csv"
+testing_file <- "pml-testing.csv"
+url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/"
+
+if (!file.exists(training_file)) {
+  download.file(paste0(url, training_file), training_file)
+}
+
+if (!file.exists(testing_file)) {
+  download.file(paste0(url, testing_file), testing_file)
+}
+
+# Read and drop empty column
+pml_training <- read_csv(training_file) %>% select(-X1)
+pml_testing <- read_csv(testing_file) %>% select(-X1)
+
+# Drop date parts and convert other features to doubles.
+pml_training <- pml_training %>%
+  mutate_at(vars(roll_belt:magnet_forearm_z), as.double) %>%
+  select(-raw_timestamp_part_1, -raw_timestamp_part_2)
+
+pml_testing <- pml_testing %>%
+  mutate_at(vars(roll_belt:magnet_forearm_z), as.double) %>%
+  select(-raw_timestamp_part_1, -raw_timestamp_part_2)
+```
+
+### Dealing with Missingness
+
+Some of the columns in this dataset have a high degree of missingness. While some machine learning algorithms can deal with missingness, it would likely make our lives easier to deal with the missingness if possible.
+
+```{r missing_rate}
+# Check missing rates by column
+testing_missing <- apply(pml_testing, 2,function(x) {sum(is.na(x))/length(x)})
+training_missing <- apply(pml_training, 2,function(x) {sum(is.na(x))/length(x)})
+```
+
+
+There are `r sum(testing_missing)` columns that are 100% missing in the testing dataset. The training dataset has `r sum(training_missing > 0.97)` columns that are 97% missing. Unless if missingness is connected to one of the classes, it seems reasonable to assume these columns will not add much value to our model performance on the testing dataset. The table below checks if the missing rate is particularly high for a given class in the training data for a few of the columns that were entirely missing in the testing dataset:
+
+
+```{r missing_vs_class}
+# Is missingness related to any specific class?
+pml_training %>%
+  group_by(classe) %>%
+  summarise_at(vars(kurtosis_roll_belt,
+                    stddev_yaw_forearm,
+                    var_yaw_forearm),
+               ~sum(is.na(.))/n()) %>%
+  knitr::kable()
+```
+
+It doesn't seem like a particular class has a higher rate of missing, so these columns will be droped from **both** the training and testing datasets.
+
+```{r drop_missing, message=FALSE, warning=FALSE}
+# Subset both datasets to columns not 100% missing in *testing*
+pml_testing <- pml_testing[,which(testing_missing != 1)]
+pml_training <- pml_training[,which(testing_missing != 1)]
+```
+
+### Caret Training and Test Data
+
+Regardless of any cross-validation that will be used subsequently, an additional hold-out dataset will be made to provide an additional estimate of the error that should be expected from the testing dataset. The hold-out dataset will not inform any aspect of the model training. While this might not be totally necessary with the cross validation being used in subsequent model training, this hold-out dataset just provides some additional assurance that the model training did not overly bias anything towards the training data.
+
+```{r train_data, message=FALSE, warning=FALSE}
+set.seed(451)
+
+# Drop info about subject/time
+train_matrix <- pml_training %>% 
+  select(-(user_name:num_window))
+test_matrix <- pml_testing %>%
+  select(-(user_name:num_window), -problem_id)
+
+# Train/Hold-Out Split
+train_index <- createDataPartition(train_matrix$classe, 
+                                   p = 0.8, list = FALSE)
+
+holdout_matrix <- train_matrix[-train_index,]
+train_matrix <- train_matrix[train_index,]
+```
+
+## Model Training
+
+Since this is a quick analysis, this model will be built in two steps:
+
+1. Model selection: GBMs (through `xgboost`) or Random Forests (through `randomForest`)
+2. Parameter tuning on selected model type
+
+Model selection will use the GBM and Random Forest algorithms in a roughly "out of the box" state. Cross validation will be used to ensure that the selected algorithm performed consistently better than the alternative, but no additional parameter tuning will be performed. The selected algorithm will then go through some parameter tuning process to improve the final model.
+
+### Out of the Box GBM vs Random Forest
+
+First, a GBM will be trained using `xgboost` without any parameter tuning. The parameters chosen below were based on the `caret` package's default parameters for `xgboost` erring towards a more flexible model. `xgboost` is an ensemble boosting algorithm that sequentially builds decision trees to produce a highly flexible model. More can be read about `xgboost`[here](https://xgboost.readthedocs.io/en/latest/).
+
+``` {r train_gbm}
+set.seed(123)
+
+tc_xgb <- trainControl(method = "cv", 
+                       number = 10,
+                       verboseIter = FALSE,
+                       allowParallel = TRUE)
+
+# Sensible defaults based on default grid searching from Caret
+defaults_xgb <- expand.grid(
+  eta = 0.4,
+  max_depth = 3,
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.75,
+  nrounds = 150
+)
+
+# Load or train
+model_file <- "xgb_pml_baseline.rds"
+
+if (!file.exists(model_file)) {
+  xgb_pml <- train(classe ~ ., 
+                 data = train_matrix,
+                 trControl = tc_xgb,
+                 tuneGrid = defaults_xgb,
+                 method = "xgbTree")
+
+  saveRDS(xgb_pml, model_file)
+
+} else {
+  
+  xgb_pml <- readRDS(model_file)
+  
+}
+```
+
+Second, a random forest will be trained using the `randomForest` package. A random forest is a bagging algorithm that averages the results of many decision trees to--similar to `xgboost`--create a highly flexible model. [Curiously](https://stats.stackexchange.com/questions/50210/caret-and-randomforest-number-of-trees), `caret` only provides one parameter for tuning from `randomForest`--`mtry`. Here, `mtry` is set to the square root of the number of features per the recommendation of the [`randoForest` documentation](https://cran.r-project.org/web/packages/randomForest/randomForest.pdf).
+
+``` {r train_rf}
+set.seed(123)
+
+tc_rf <- trainControl(method="cv", 
+                      number=10)
+
+# Recommended parameter from docs for randomForest
+defaults_rf <- expand.grid(mtry=sqrt(ncol(train_matrix) -1))
+
+# Load or train
+model_file <- "rf_pml_baseline.rds"
+
+if (!file.exists(model_file)) {
+  rf_pml <- train(classe~., 
+                data= train_matrix, 
+                trControl = tc_rf, 
+                tuneGrid = defaults_rf,
+                ntree = 150,
+                method="rf")
+
+  saveRDS(rf_pml, model_file)
+
+} else {
+  
+  rf_pml <- readRDS(model_file)
+  
+}
+
+
+```
+
+#### Verdict
+
+The `xgboost` model ended up with a cross validated accuracy of `r round(xgb_pml$results$Accuracy,4)` while the `radomForest` model ended up with a cross validated accuracy of `r round(rf_pml$results$Accuracy,4)`.
+
+``` {r verdict}
+union_all(bind_cols(rf_pml$resample, type = 'Random Forest'), 
+          bind_cols(xgb_pml$resample, type = 'XGBoost')) %>%
+  ggplot(aes(Resample, Accuracy, group = type, color = type)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  labs(color = NULL) +
+  ggtitle("Fold Performance: XGBoost vs Random Forest")
+```
+
+While `xgboost` may have won out overall, the performance benefit was not unanimous. In the figure above, it can be seen that there were multiple `randomForest` models that actually beat out `xgboost`. More rigorous tuning or more potentially additional trees for the `randomForest` model may have produced a better model or at least stabilized the results. Since this is a simple exercise, however, training will only be continued using the `xgboost` model.
+
+### Parameter Tuning
+
+`XGBoost` offers a lot of hyper-parameters that can be tuned. `caret` has a certain subset of these parameters available for tuning. A quick run of the suggested ranges for these parameters revealed that `eta`, `max_depth`, and `nrounds` seemed to have the largest impact on accuracy. For that reason, only these parameters will be tuned over the following ranges:
+
+| Parameter   | Values        |
+| ----------- | ------------- |
+| eta         | 0.3, 0.4, 0.5 |
+| max_depth   | 3, 4, 5       |
+| nrounds     | 150, 300, 450 |
+
+Finally, the number of folds for this parameter tuning will be reduced to 5 folds for time's sake. What does 5-fold cross validation mean in this context? Since there are 3 different values for 3 different hyper parameters proposed, 9 models are being evaluated in total. Each of these 9 models will be built 5 separate on 5 different train-test splits from the cross validation process for a total of 45 models. Finally, `caret` will build a final model on the parameters that held the highest cross validated accuracy using the entire training dataset.
+
+``` {r tune_gbm}
+set.seed(123)
+
+tc_xgb <- trainControl(method = "cv", 
+                       number = 5, # because time...
+                       verboseIter = FALSE,
+                       allowParallel = TRUE)
+
+# Sensible defaults based on default grid searching from Caret
+defaults_xgb <- expand.grid(
+  eta = c(0.3, 0.4, 0.5),
+  max_depth = c(3, 4, 5),
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.75,
+  nrounds = c(150, 300, 450)
+)
+
+model_file <- "xgb_pml.rds"
+
+if (!file.exists(model_file)) {
+  xgb_pml <- train(classe ~ ., 
+                 data = train_matrix,
+                 trControl = tc_xgb,
+                 tuneGrid = defaults_xgb,
+                 method = "xgbTree")
+
+  saveRDS(xgb_pml, model_file)
+
+} else {
+  
+  xgb_pml <- readRDS(model_file)
+  
+}
+
+```
+
+The process selected an `eta` of `r xgb_pml$bestTune$eta`, a `max_depth` of `r xgb_pml$bestTune$max_depth`, and an `nrounds` of `r xgb_pml$bestTune$nrounds`. Note that the parameters that were settled on by this process hit the lower/upper ranges for `eta`, `max_depth`, and `nrounds`. This could suggest that additional parameter tuning could further improve the models.
+
+## Validation and Prediction on Test Set
+
+How did the tuned `xgboost` model perform on the holdout dataset?
+
+``` {r validate}
+confusion_matrix <- confusionMatrix(
+  predict(xgb_pml, newdata = holdout_matrix),
+  factor(holdout_matrix$classe))
+
+rounded_accuracy <- round(confusion_matrix$overall["Accuracy"],4)
+
+confusion_matrix$table %>%
+  knitr::kable(caption = "Rows: Prediction / Columns: Reference")
+```
+
+Overall, this model seems to be predicting well on the holdout dataset with a holdout accuracy of `r rounded_accuracy` compared to the cross validated accuracy of `r round(mean(xgb_pml$resample$Accuracy),4)`. This model actually performs slightly better on the hold-out dataset compared to the cross validated model accuracy.
+
+Given the high cross validated accuracy, it should be expected that this model will perform well on the remaining test data. The model is misclassifies `r (1 - round(mean(xgb_pml$resample$Accuracy),3)) * 1000` out of every 1,000 examples. This means there is a fairly good chance that we should classify all 20 test cases accurately.
+
+Finally, predictions will be produced for the test dataset, and submission on Coursera.
+
+```{r predict_test}
+data.frame(
+  `Problem ID` = pml_testing$problem_id,
+  Prediction = predict(xgb_pml,newdata = test_matrix)
+) %>%
+  knitr::kable()
+```
+
+## Conclusion
+
+This project found that the `xgboost` classification algorithm fit a better model for predicting activity class from accelerometer data than `randomForest` with minimal parameter tuning. Further parameter tuning on either algorithm could further improve performance. Other considerations to examine might include which algorithm is easier to deploy for real-time classification.
+
+## References
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
